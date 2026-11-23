@@ -1,0 +1,27 @@
+# /opt/asm/etc/asm.conf — scanner tuning. Sourced by every asm-*.sh script.
+# Every value is optional; defaults live in asm-common.sh.
+
+# Subdomain brute force (shuffledns+massdns). Off by default: it is noisy and
+# needs reliable resolvers. Set to 1 to enable for every discovery run.
+ASM_BRUTEFORCE=0
+ASM_SHUFFLEDNS_THREADS=50
+
+# Hard cap on hosts handled per run (protects scanner + MongoDB).
+ASM_MAX_HOSTS=500
+
+# httpx
+ASM_HTTPX_THREADS=40
+ASM_HTTPX_PORTS_DISCOVERY=80,443,8080,8443
+ASM_HTTPX_PORTS_FINGERPRINT=80,443,3000,5000,8000,8008,8080,8081,8443,8888,9000,9443
+
+# nmap: targeted list (not a full sweep). CDN edge IPs and private IPs are skipped.
+ASM_NMAP_PORTS=21,22,23,25,53,80,110,111,135,139,143,389,443,445,465,587,993,995,1433,1521,2049,2375,2376,3000,3306,3389,5000,5432,5601,5900,5984,6379,8000,8080,8081,8443,8888,9000,9090,9200,9300,11211,27017
+ASM_NMAP_MAX_RATE=200
+ASM_NMAP_SKIP_CDN=1
+
+# nuclei: safe profile (no DoS / fuzzing / brute force / intrusive templates)
+ASM_NUCLEI_SEVERITY=low,medium,high,critical
+ASM_NUCLEI_RATE=50
+ASM_NUCLEI_CONC=25
+ASM_NUCLEI_EXCLUDE_TAGS=dos,fuzz,bruteforce,intrusive
+ASM_NUCLEI_MAX_SECONDS=3600
