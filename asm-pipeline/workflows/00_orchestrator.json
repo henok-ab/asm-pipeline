@@ -1,0 +1,482 @@
+{
+  "id": "asmOrchestrator1",
+  "name": "ASM - 0. Orchestrator (chat agent)",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "public": false,
+        "options": {}
+      },
+      "id": "580cc7fe-a070-502f-b2b8-c5036f75f00a",
+      "name": "Chat Trigger",
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "4dfcacf2-95c6-5437-914a-8b0de2476447"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Deterministic approval gate. The LLM never sees this logic and cannot forge its result:\n// only a user message of the exact form \"APPROVE <domain>\" creates an approval record.\nconst input = $input.first().json;\nconst msg = String(input.chatInput || '').trim();\nconst m = msg.match(/^approve\\s+([a-z0-9.-]+)$/i);\nconst re = /^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$/;\nconst domain = m ? m[1].toLowerCase().replace(/\\.$/, '') : null;\nconst isApproval = !!(domain && re.test(domain));\nconst now = new Date();\nconst TTL_MIN = 30;\nreturn [{ json: {\n  chatInput: msg,\n  sessionId: input.sessionId,\n  isApproval,\n  approvedDomain: isApproval ? domain : null,\n  domain: isApproval ? domain : null,\n  status: 'granted',\n  granted_at: now.toISOString(),\n  expires_at: new Date(now.getTime() + TTL_MIN * 60000).toISOString(),\n  session_id: String(input.sessionId || ''),\n} }];\n"
+      },
+      "id": "7dbaa32c-3fb4-5ce7-bd88-3296dc2ba949",
+      "name": "Approval Interceptor",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0bfac564-03dc-5471-8217-d720c9f6ac00",
+              "leftValue": "={{ $json.isApproval }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "7a795028-06a2-57c1-8f0c-cde4e83ebc4d",
+      "name": "Is Approval?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        520,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "collection": "approvals",
+        "updateKey": "domain",
+        "fields": "domain,status,granted_at,expires_at,session_id",
+        "options": {
+          "upsert": true,
+          "dateFields": "granted_at,expires_at"
+        }
+      },
+      "id": "5cb80dc1-2b90-5057-b596-c27c7453486c",
+      "name": "Record Approval",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.1,
+      "position": [
+        780,
+        200
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "asmMongoDb000001",
+          "name": "ASM MongoDB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $('Approval Interceptor').first().json.chatInput }}{{ $('Approval Interceptor').first().json.isApproval ? '\\n\\n[GATE: approval recorded for ' + $('Approval Interceptor').first().json.approvedDomain + '; valid 30 minutes; single use]' : '' }}",
+        "options": {
+          "systemMessage": "You are ASM Orchestrator, an autonomous Attack Surface Management agent. You help an authorised security operator assess the external exposure of domains they own or are explicitly authorised to test.\n\n## Hard rules (never break these)\n1. HISTORY FIRST. Whenever a domain is mentioned, call `check_previous_scans` before anything else.\n2. APPROVAL GATE. Never call `run_discovery`, `run_fingerprinting` or `run_vulnerability_scan` unless the CURRENT user message ends with a line starting \"[GATE: approval recorded for <domain>\". That line is added by the platform's approval gate only after the user typed `APPROVE <domain>`. Do not call scan tools on any other basis. Never claim you approved on the user's behalf. Never tell the user approval is optional.\n3. SCOPE. One root domain per scan. If any tool answers \"REFUSED\", show the reason to the user and stop. Do not retry, rephrase or work around it.\n4. ORDER. Run `run_discovery`, then `run_fingerprinting`, then `run_vulnerability_scan`, strictly one after another. Each takes only the domain. If a tool returns an error, stop and report which stage failed and the error text.\n5. TRUTH. State only facts that appear in tool outputs. Never invent hosts, ports, CVEs, counts or dates. Raw data lives in MongoDB; tools return summaries.\n\n## Conversation flow\nA. User names a domain -> call `check_previous_scans`.\nB. Briefly tell the user: was it scanned before, the last scan time (and age), key counts, and the stored verdict if any. If the last scan is under 24h old, mention they can simply review stored results instead of rescanning.\nC. If the user wants a scan or rescan, explain in 2-3 lines what will run (subdomain enumeration, DNS, HTTP/TLS probing, targeted port scan, Nuclei templates) and that this is an ACTIVE scan against the target. Ask them to reply exactly: APPROVE <domain>. Then stop and wait.\nD. When the GATE line is present: run the three stages in order. Send one short progress sentence between stages only if useful.\nE. If the user only wants stored results, answer from `check_previous_scans` output (it includes the exposure summary) without scanning.\n\n## Final answer format (after run_vulnerability_scan)\n**Verdict:** copy the tool's `verdict` and explain it in plain words (EXPOSED = at least one medium-or-higher issue; LIMITED_EXPOSURE = only low-risk issues; INTERNET_FACING_ONLY = public web assets with no issues found; NO_EXPOSURE_FOUND = nothing live).\n**Why:** 2-5 bullets taken from `reasons`.\n**Assets:** subdomains found, live hosts, new vs already known.\n**Exposed services:** the `risky_services` (host/IP:port, service, product/version). Say \"none\" if empty.\n**Nuclei findings:** counts per severity and the top findings (template, host, matched URL, CVE if any).\n**Suggested next steps:** 2-4 concrete remediation or verification actions.\nAdd the tool's `caveat` in one short sentence. Keep the whole answer compact.",
+          "maxIterations": 15
+        }
+      },
+      "id": "640c7930-35a8-51af-ac07-6cd1d3ed02b1",
+      "name": "ASM Orchestrator Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [
+        1060,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "model": "llama3.1:8b",
+        "options": {
+          "temperature": 0,
+          "numCtx": 8192
+        }
+      },
+      "id": "84398a4f-5737-539a-822c-98e3cb6ee8b0",
+      "name": "Ollama Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [
+        900,
+        560
+      ],
+      "credentials": {
+        "ollamaApi": {
+          "id": "asmOllama0000001",
+          "name": "ASM Ollama"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $('Chat Trigger').first().json.sessionId }}",
+        "tableName": "n8n_chat_histories",
+        "contextWindowLength": 20
+      },
+      "id": "f841c340-6577-5d9c-965b-61fded9f6484",
+      "name": "Postgres Chat Memory",
+      "type": "@n8n/n8n-nodes-langchain.memoryPostgresChat",
+      "typeVersion": 1.3,
+      "position": [
+        1100,
+        560
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "asmPostgres00001",
+          "name": "ASM Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "name": "check_previous_scans",
+        "description": "ALWAYS call this first for any domain. Read-only MongoDB lookup: returns whether the domain was scanned before, the last scan time and age, asset counts and the stored exposure summary (verdict, reasons, risky services, Nuclei findings). Input: root domain.",
+        "workflowId": {
+          "__rl": true,
+          "value": "asmDbQuery000001",
+          "mode": "id"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "domain": "={{ $fromAI('domain', 'The bare root domain, e.g. example.com (no scheme, no path)', 'string') }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "domain",
+              "displayName": "domain",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        }
+      },
+      "id": "3370feb5-06c8-5b1c-993a-b871229a4dd7",
+      "name": "check_previous_scans",
+      "type": "@n8n/n8n-nodes-langchain.toolWorkflow",
+      "typeVersion": 2.2,
+      "position": [
+        1260,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "name": "run_discovery",
+        "description": "STAGE 1 of 3. ACTIVE scan: enumerates subdomains (subfinder, assetfinder, optional shuffledns), resolves DNS (dnsx), probes live HTTP hosts (httpx) and upserts them into MongoDB. Refuses unless the domain is in scope AND the user has approved it (APPROVE <domain>). Input: root domain.",
+        "workflowId": {
+          "__rl": true,
+          "value": "asmDiscovery0001",
+          "mode": "id"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "domain": "={{ $fromAI('domain', 'The bare root domain, e.g. example.com (no scheme, no path)', 'string') }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "domain",
+              "displayName": "domain",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        }
+      },
+      "id": "3eaeca49-97bb-51c6-8a4e-a0c23967cc97",
+      "name": "run_discovery",
+      "type": "@n8n/n8n-nodes-langchain.toolWorkflow",
+      "typeVersion": 2.2,
+      "position": [
+        1420,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "name": "run_fingerprinting",
+        "description": "STAGE 2 of 3. ACTIVE scan: HTTP/TLS fingerprinting (httpx) and targeted nmap service detection on discovered live hosts; writes http, tls and port_scanning data to MongoDB. Only works after run_discovery succeeded for the same domain. Input: root domain.",
+        "workflowId": {
+          "__rl": true,
+          "value": "asmFingerprint01",
+          "mode": "id"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "domain": "={{ $fromAI('domain', 'The bare root domain, e.g. example.com (no scheme, no path)', 'string') }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "domain",
+              "displayName": "domain",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        }
+      },
+      "id": "db4e2a20-a598-5963-9e5d-fb6b535acc58",
+      "name": "run_fingerprinting",
+      "type": "@n8n/n8n-nodes-langchain.toolWorkflow",
+      "typeVersion": 2.2,
+      "position": [
+        1580,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "name": "run_vulnerability_scan",
+        "description": "STAGE 3 of 3. ACTIVE scan: runs Nuclei against discovered URLs, writes findings to MongoDB, closes the scan and returns the final exposure verdict with reasons. Only works after run_fingerprinting succeeded for the same domain. Input: root domain.",
+        "workflowId": {
+          "__rl": true,
+          "value": "asmVuln000000001",
+          "mode": "id"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "domain": "={{ $fromAI('domain', 'The bare root domain, e.g. example.com (no scheme, no path)', 'string') }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "domain",
+              "displayName": "domain",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        }
+      },
+      "id": "eccecd46-fa60-58c2-a328-9e57aa1bb92d",
+      "name": "run_vulnerability_scan",
+      "type": "@n8n/n8n-nodes-langchain.toolWorkflow",
+      "typeVersion": 2.2,
+      "position": [
+        1740,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "content": "ASM Orchestrator\nChat -> Approval Interceptor (deterministic; only `APPROVE <domain>` writes an approval to MongoDB) -> AI Agent with Postgres memory + 4 tools. Each scan tool re-checks scope + approval itself, so a mis-behaving LLM cannot start a scan.\n\nSwap 'Ollama Chat Model' for OpenAI/Anthropic/etc. if you have an API key (use a model with tool calling).",
+        "height": 200,
+        "width": 820,
+        "color": 4
+      },
+      "id": "4da47ffe-0707-508c-8d14-04f847cdf41f",
+      "name": "Note ASM Orchestrator",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        20
+      ]
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-2.5-flash",
+        "options": {
+          "temperature": 0
+        }
+      },
+      "id": "a4d0b4d1-5c5f-4e70-9f15-2e3a9b7c6101",
+      "name": "Gemini Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        900,
+        740
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "id": "asmGemini0000001",
+          "name": "ASM Gemini"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Chat Trigger": {
+      "main": [
+        [
+          {
+            "node": "Approval Interceptor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approval Interceptor": {
+      "main": [
+        [
+          {
+            "node": "Is Approval?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Approval?": {
+      "main": [
+        [
+          {
+            "node": "Record Approval",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "ASM Orchestrator Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Approval": {
+      "main": [
+        [
+          {
+            "node": "ASM Orchestrator Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "ASM Orchestrator Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres Chat Memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "ASM Orchestrator Agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "check_previous_scans": {
+      "ai_tool": [
+        [
+          {
+            "node": "ASM Orchestrator Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "run_discovery": {
+      "ai_tool": [
+        [
+          {
+            "node": "ASM Orchestrator Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "run_fingerprinting": {
+      "ai_tool": [
+        [
+          {
+            "node": "ASM Orchestrator Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "run_vulnerability_scan": {
+      "ai_tool": [
+        [
+          {
+            "node": "ASM Orchestrator Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

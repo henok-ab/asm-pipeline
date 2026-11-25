@@ -1,0 +1,503 @@
+{
+  "id": "asmDiscovery0001",
+  "name": "ASM - 2. Discovery (tool: run_discovery)",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "domain",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "id": "86ad658f-543b-5173-aca8-5047f746e85a",
+      "name": "When Executed by Another Workflow",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = String($input.first().json.domain || '').trim().toLowerCase()\n  .replace(/^[a-z]+:\\/\\//, '').replace(/[\\/?#].*$/, '').replace(/\\.$/, '');\nconst re = /^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$/;\nif (!re.test(raw)) {\n  throw new Error('Invalid domain \"' + raw + '\". Provide a bare domain such as example.com.');\n}\nreturn [{ json: { domain: raw } }];\n"
+      },
+      "id": "9453bf85-2c81-5393-b4ea-a8ca4e846c86",
+      "name": "Validate Domain",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "find",
+        "collection": "scope",
+        "options": {},
+        "query": "{\"active\":{\"$ne\":false}}"
+      },
+      "id": "86f95f3b-b035-540a-b00d-54992e57e5c2",
+      "name": "Find Scope",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.1,
+      "position": [
+        520,
+        300
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "asmMongoDb000001",
+          "name": "ASM MongoDB"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const domain = $('Validate Domain').first().json.domain;\nconst scopes = $input.all().map((i) => i.json).filter((j) => j && j.domain && j.active !== false).map((j) => String(j.domain).toLowerCase());\nconst matched = scopes.find((s) => domain === s || domain.endsWith('.' + s));\nreturn [{ json: { domain, in_scope: !!matched, matched_scope: matched || null } }];\n"
+      },
+      "id": "2c25db01-2629-5464-8b34-4463765ac481",
+      "name": "Scope Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "find",
+        "collection": "approvals",
+        "options": {},
+        "query": "={\"domain\":\"{{ $json.domain }}\"}"
+      },
+      "id": "2681d5b4-f3a5-541e-a3b8-649bd3bb16dd",
+      "name": "Find Approval",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.1,
+      "position": [
+        1040,
+        300
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "asmMongoDb000001",
+          "name": "ASM MongoDB"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const sc = $('Scope Check').first().json;\nconst domain = sc.domain;\nif (!sc.in_scope) {\n  throw new Error('REFUSED: ' + domain + ' is not in the authorised scope list (MongoDB collection \"scope\"). The operator must add it with scripts/add-scope.sh after confirming written authorisation.');\n}\nconst ap = $input.all().map((i) => i.json).find((j) => j && j.domain === domain);\nconst now = new Date();\nif (!ap || ap.status !== 'granted' || !ap.expires_at || new Date(ap.expires_at) <= now) {\n  throw new Error('REFUSED: no valid user approval for ' + domain + '. The user must reply exactly \"APPROVE ' + domain + '\". Approvals are single-use and expire after 30 minutes.');\n}\nconst scan_id = 'scan-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);\nreturn [{ json: {\n  domain, scan_id,\n  approved_at: ap.granted_at || now.toISOString(),\n  approval_session: ap.session_id || '',\n  matched_scope: sc.matched_scope,\n  status: 'consumed',\n  consumed_at: now.toISOString(),\n} }];\n"
+      },
+      "id": "1ee90d43-f3d4-5e4e-9231-0670d79add88",
+      "name": "Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "collection": "approvals",
+        "updateKey": "domain",
+        "fields": "domain,status,consumed_at",
+        "options": {
+          "dateFields": "consumed_at"
+        }
+      },
+      "id": "846174d4-5dfa-5b8d-90b3-ad44b7e07225",
+      "name": "Consume Approval",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.1,
+      "position": [
+        1560,
+        300
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "asmMongoDb000001",
+          "name": "ASM MongoDB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const g = $('Gate').first().json;\nreturn [{ json: {\n  scan_id: g.scan_id,\n  root_domain: g.domain,\n  status: 'running',\n  stage: 'discovery',\n  started_at: g.consumed_at,\n  approved_at: g.approved_at,\n  approval_session: g.approval_session,\n  matched_scope: g.matched_scope,\n} }];\n"
+      },
+      "id": "3cb72042-fc62-5fc2-add9-e99d8bd0b28e",
+      "name": "Prepare Scan Run",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1820,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "collection": "scan_runs",
+        "fields": "scan_id,root_domain,status,stage,started_at,approved_at,approval_session,matched_scope",
+        "options": {
+          "dateFields": "started_at,approved_at"
+        }
+      },
+      "id": "f92fcc44-12ad-56ca-a538-b1915cd47775",
+      "name": "Create Scan Run",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.1,
+      "position": [
+        2080,
+        300
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "asmMongoDb000001",
+          "name": "ASM MongoDB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "command",
+        "operation": "execute",
+        "authentication": "privateKey",
+        "command": "={{ '/opt/asm/bin/asm-discover.sh ' + $('Gate').first().json.domain }}",
+        "cwd": "/opt/asm"
+      },
+      "id": "3eb7d8af-5307-597a-aba5-5069bd07cebc",
+      "name": "Run Discovery",
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        2340,
+        300
+      ],
+      "credentials": {
+        "sshPrivateKey": {
+          "id": "asmSshKey0000001",
+          "name": "ASM Scanner SSH"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "find",
+        "collection": "domains",
+        "options": {
+          "projection": "{\"host\":1,\"first_seen\":1,\"status\":1}"
+        },
+        "query": "={\"root_domain\":\"{{ $('Gate').first().json.domain }}\"}"
+      },
+      "id": "e616a31b-84d2-5966-a4f6-139ca7037a93",
+      "name": "Find Existing Assets",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.1,
+      "position": [
+        2600,
+        300
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "asmMongoDb000001",
+          "name": "ASM MongoDB"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const ssh = $('Run Discovery').first().json;\nconst g = $('Gate').first().json;\nif (ssh.code !== undefined && ssh.code !== 0) {\n  throw new Error('Discovery script failed (exit ' + ssh.code + '): ' + String(ssh.stderr || '').slice(-800));\n}\nlet out;\ntry { out = JSON.parse(ssh.stdout); }\ncatch (e) { throw new Error('Discovery output was not valid JSON: ' + String(ssh.stdout || '').slice(0, 300) + ' | stderr: ' + String(ssh.stderr || '').slice(-500)); }\n\nconst existing = new Map($input.all().map((i) => i.json).filter((j) => j && j.host).map((j) => [j.host, j]));\nconst dnsBy = new Map((out.dns || []).map((d) => [d.host, d]));\nconst liveBy = new Map((out.live || []).map((l) => [l.host, l]));\nconst now = new Date().toISOString();\nconst hosts = Array.from(new Set((out.subdomains || []).map((h) => String(h).toLowerCase())));\n\nconst docs = hosts.map((host) => {\n  const d = dnsBy.get(host) || { a: [], aaaa: [], cname: [], rcode: '' };\n  const resolved = (d.a.length + d.aaaa.length) > 0;\n  const lv = liveBy.get(host);\n  const prev = existing.get(host);\n  return { json: {\n    host,\n    root_domain: g.domain,\n    first_seen: prev && prev.first_seen ? prev.first_seen : now,\n    last_seen: now,\n    last_scan_id: g.scan_id,\n    status: lv ? 'live' : (resolved ? 'resolved' : 'unresolved'),\n    dns: {\n      a: [...d.a].sort(), aaaa: [...d.aaaa].sort(), cname: [...d.cname].sort(),\n      rcode: d.rcode, resolved,\n      dangling_cname: !resolved && d.cname.length > 0,\n      updated_at: now,\n    },\n    discovery: { live_probe: lv ? lv.services : [], scan_id: g.scan_id, updated_at: now },\n    _is_new: !prev,\n  } };\n});\nreturn docs;\n"
+      },
+      "id": "cef8530f-ef7e-589a-9005-8f2a68c0f992",
+      "name": "Normalize & Merge",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2860,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "collection": "domains",
+        "updateKey": "host",
+        "fields": "host,root_domain,first_seen,last_seen,last_scan_id,status,dns,discovery",
+        "options": {
+          "upsert": true,
+          "dateFields": "first_seen,last_seen"
+        }
+      },
+      "id": "dcc0b818-2762-5e7c-9f29-a53c267251ce",
+      "name": "Upsert Hosts",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.1,
+      "position": [
+        3120,
+        300
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "asmMongoDb000001",
+          "name": "ASM MongoDB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const g = $('Gate').first().json;\nconst out = JSON.parse($('Run Discovery').first().json.stdout);\nconst items = $('Normalize & Merge').all().map((i) => i.json);\nconst now = new Date().toISOString();\nconst live = items.filter((i) => i.status === 'live');\nconst summary = {\n  ok: true,\n  stage: 'discovery',\n  scan_id: g.scan_id,\n  domain: g.domain,\n  subdomains_found: items.length,\n  new_assets: items.filter((i) => i._is_new).length,\n  already_known: items.filter((i) => !i._is_new).length,\n  live_hosts: live.length,\n  resolved_not_live: items.filter((i) => i.status === 'resolved').length,\n  unresolved: items.filter((i) => i.status === 'unresolved').length,\n  dangling_cname_candidates: items.filter((i) => i.dns.dangling_cname).map((i) => i.host).slice(0, 10),\n  source_counts: out.tools,\n  bruteforce: out.bruteforce,\n  sample_live_hosts: live.map((i) => i.host).slice(0, 10),\n  warnings: out.warnings || [],\n  next_step: live.length ? 'run_fingerprinting' : 'No live hosts: stop and report.',\n};\nreturn [{ json: { scan_id: g.scan_id, stage: 'discovery_done', updated_at: now, discovery_summary: summary } }];\n"
+      },
+      "id": "d77d8eb6-96eb-5524-b5e7-ecc9fe15e9a5",
+      "name": "Discovery Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3380,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "collection": "scan_runs",
+        "updateKey": "scan_id",
+        "fields": "scan_id,stage,updated_at,discovery_summary",
+        "options": {
+          "dateFields": "updated_at"
+        }
+      },
+      "id": "4232d36a-f6d8-51be-9083-6264f18ffe2d",
+      "name": "Update Scan Run",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.1,
+      "position": [
+        3640,
+        300
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "asmMongoDb000001",
+          "name": "ASM MongoDB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: $('Discovery Summary').first().json.discovery_summary }];\n"
+      },
+      "id": "5f79e5ee-522c-5990-9518-5106c3ea8a23",
+      "name": "Final Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3900,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "content": "Discovery sub-workflow\n1 validate -> 2 scope allow-list -> 3 HUMAN APPROVAL gate (single-use, 30 min TTL, written by the chat front door, not by the LLM) -> 4 create scan_run -> 5 SSH: subfinder/assetfinder/(shuffledns)/dnsx/httpx -> 6 normalise + dedupe -> 7 idempotent upsert on `host`.",
+        "height": 170,
+        "width": 1100,
+        "color": 4
+      },
+      "id": "67847a1a-17fb-5dad-ade2-cf187c44c47e",
+      "name": "Note Discovery sub-workflow",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        80
+      ]
+    }
+  ],
+  "connections": {
+    "When Executed by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "Validate Domain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Domain": {
+      "main": [
+        [
+          {
+            "node": "Find Scope",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Scope": {
+      "main": [
+        [
+          {
+            "node": "Scope Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Scope Check": {
+      "main": [
+        [
+          {
+            "node": "Find Approval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Approval": {
+      "main": [
+        [
+          {
+            "node": "Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gate": {
+      "main": [
+        [
+          {
+            "node": "Consume Approval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Consume Approval": {
+      "main": [
+        [
+          {
+            "node": "Prepare Scan Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Scan Run": {
+      "main": [
+        [
+          {
+            "node": "Create Scan Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Scan Run": {
+      "main": [
+        [
+          {
+            "node": "Run Discovery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Discovery": {
+      "main": [
+        [
+          {
+            "node": "Find Existing Assets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Existing Assets": {
+      "main": [
+        [
+          {
+            "node": "Normalize & Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize & Merge": {
+      "main": [
+        [
+          {
+            "node": "Upsert Hosts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Hosts": {
+      "main": [
+        [
+          {
+            "node": "Discovery Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Discovery Summary": {
+      "main": [
+        [
+          {
+            "node": "Update Scan Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Scan Run": {
+      "main": [
+        [
+          {
+            "node": "Final Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

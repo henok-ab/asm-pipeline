@@ -1,0 +1,374 @@
+{
+  "id": "asmFingerprint01",
+  "name": "ASM - 3. Fingerprint (tool: run_fingerprinting)",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "domain",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "id": "fb64355c-e007-5cea-8ddc-f0ea744aa7b0",
+      "name": "When Executed by Another Workflow",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = String($input.first().json.domain || '').trim().toLowerCase()\n  .replace(/^[a-z]+:\\/\\//, '').replace(/[\\/?#].*$/, '').replace(/\\.$/, '');\nconst re = /^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$/;\nif (!re.test(raw)) {\n  throw new Error('Invalid domain \"' + raw + '\". Provide a bare domain such as example.com.');\n}\nreturn [{ json: { domain: raw } }];\n"
+      },
+      "id": "ee74d87b-0bc5-57c9-9ecc-f33fb644405a",
+      "name": "Validate Domain",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "find",
+        "collection": "scan_runs",
+        "options": {
+          "limit": 1,
+          "sort": "{\"started_at\":-1}"
+        },
+        "query": "={\"root_domain\":\"{{ $json.domain }}\",\"status\":\"running\"}"
+      },
+      "id": "3e0d33c0-a692-5b3c-9e22-7e92ccf39c7a",
+      "name": "Find Active Scan Run",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.1,
+      "position": [
+        520,
+        300
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "asmMongoDb000001",
+          "name": "ASM MongoDB"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const domain = $('Validate Domain').first().json.domain;\nconst run = $input.all().map((i) => i.json).find((j) => j && j.scan_id);\nconst need = [\"discovery_done\", \"fingerprint_done\"];\nif (!run) {\n  throw new Error('REFUSED: no approved, running scan exists for ' + domain + '. Run discovery first (it requires explicit user approval).');\n}\nconst ageH = (Date.now() - new Date(run.started_at).getTime()) / 3.6e6;\nif (ageH > 6) {\n  throw new Error('REFUSED: scan ' + run.scan_id + ' is older than 6 hours; a new approval and discovery run are required.');\n}\nif (!need.includes(run.stage)) {\n  throw new Error('REFUSED: scan ' + run.scan_id + ' is at stage \"' + run.stage + '\"; required stage: ' + need.join(' or ') + '.');\n}\nreturn [{ json: { domain, scan_id: run.scan_id } }];\n"
+      },
+      "id": "d3f57320-5db1-5a63-98b2-50b9c0ed4b27",
+      "name": "Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "find",
+        "collection": "domains",
+        "options": {
+          "projection": "{\"host\":1}"
+        },
+        "query": "={\"root_domain\":\"{{ $json.domain }}\",\"status\":\"live\",\"last_scan_id\":\"{{ $json.scan_id }}\"}"
+      },
+      "id": "5469fa91-dec0-559c-bb2c-b4f275d0709b",
+      "name": "Find Live Hosts",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.1,
+      "position": [
+        1040,
+        300
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "asmMongoDb000001",
+          "name": "ASM MongoDB"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const g = $('Gate').first().json;\nconst re = /^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$/;\nconst hosts = Array.from(new Set($input.all().map((i) => i.json.host).filter((h) => h && re.test(h)))).slice(0, 500);\nreturn [{ json: { domain: g.domain, scan_id: g.scan_id, hosts, count: hosts.length, targets_b64: Buffer.from(hosts.join('\\n')).toString('base64') } }];\n"
+      },
+      "id": "77472b25-957b-5401-9643-0e5b4a76ed0b",
+      "name": "Build Target List",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "command",
+        "operation": "execute",
+        "authentication": "privateKey",
+        "command": "={{ \"echo '\" + $json.targets_b64 + \"' | base64 -d | /opt/asm/bin/asm-fingerprint.sh --stdin\" }}",
+        "cwd": "/opt/asm"
+      },
+      "id": "a26ff3c7-e5dd-587d-b907-c8c20c4530eb",
+      "name": "Run Fingerprint",
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        1560,
+        300
+      ],
+      "credentials": {
+        "sshPrivateKey": {
+          "id": "asmSshKey0000001",
+          "name": "ASM Scanner SSH"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const g = $('Build Target List').first().json;\nconst ssh = $('Run Fingerprint').first().json;\nif (ssh.code !== undefined && ssh.code !== 0) {\n  throw new Error('Fingerprint script failed (exit ' + ssh.code + '): ' + String(ssh.stderr || '').slice(-800));\n}\nlet out;\ntry { out = JSON.parse(ssh.stdout); }\ncatch (e) { throw new Error('Fingerprint output was not valid JSON: ' + String(ssh.stdout || '').slice(0, 300) + ' | stderr: ' + String(ssh.stderr || '').slice(-500)); }\nconst now = new Date().toISOString();\nconst profile = (out.nmap && out.nmap.ports_profile) || '';\nconst docs = (out.hosts || []).map((h) => ({ json: {\n  host: h.host,\n  http: { services: h.http_services || [], updated_at: now },\n  tls: { certificates: h.tls_certificates || [], updated_at: now },\n  port_scanning: { ips: h.ips || [], ports_profile: profile, tool: 'nmap -sT -sV --version-light', scanned_at: now },\n  fingerprint_scan_id: g.scan_id,\n} }));\nif (!docs.length) docs.push({ json: { host: '__none__' } });\nreturn docs;\n"
+      },
+      "id": "7b1701e7-14c9-5623-96b5-8eb4a636ff0a",
+      "name": "Normalize Fingerprint",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1820,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "collection": "domains",
+        "updateKey": "host",
+        "fields": "host,http,tls,port_scanning,fingerprint_scan_id",
+        "options": {}
+      },
+      "id": "b6b3fa55-c50f-5347-95c7-d7fad5655d4c",
+      "name": "Update Hosts",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.1,
+      "position": [
+        2080,
+        300
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "asmMongoDb000001",
+          "name": "ASM MongoDB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const g = $('Build Target List').first().json;\nconst out = JSON.parse($('Run Fingerprint').first().json.stdout);\nconst hosts = out.hosts || [];\nconst WEB = new Set([80, 443, 3000, 5000, 8000, 8008, 8080, 8081, 8443, 8888, 9000, 9443]);\nlet services = 0, httpsHosts = 0;\nconst tech = {}, tlsIssues = [], openSeen = new Set(), nonWeb = [];\nfor (const h of hosts) {\n  services += (h.http_services || []).length;\n  if ((h.http_services || []).some((s) => s.scheme === 'https')) httpsHosts++;\n  for (const s of (h.http_services || [])) for (const t of (s.tech || [])) tech[t] = (tech[t] || 0) + 1;\n  for (const c of (h.tls_certificates || [])) {\n    const issues = [];\n    if (c.expired) issues.push('expired');\n    if (c.self_signed) issues.push('self-signed');\n    if (c.mismatched) issues.push('hostname mismatch');\n    if (issues.length) tlsIssues.push({ host: h.host, port: c.port, issues });\n  }\n  for (const ip of (h.ips || [])) for (const p of (ip.open_ports || [])) {\n    const k = ip.ip + ':' + p.port;\n    if (openSeen.has(k)) continue;\n    openSeen.add(k);\n    if (!WEB.has(p.port)) nonWeb.push({ ip: ip.ip, port: p.port, service: p.service, product: [p.product, p.version].filter(Boolean).join(' ') || null });\n  }\n}\nconst skipped = {};\nfor (const r of Object.values((out.nmap && out.nmap.skipped) || {})) skipped[r] = (skipped[r] || 0) + 1;\nconst summary = {\n  ok: true,\n  stage: 'fingerprinting',\n  scan_id: g.scan_id,\n  domain: g.domain,\n  hosts_requested: g.count,\n  hosts_fingerprinted: hosts.length,\n  http_services: services,\n  https_hosts: httpsHosts,\n  tls_issues_count: tlsIssues.length,\n  tls_issues: tlsIssues.slice(0, 10),\n  ips_scanned_with_nmap: ((out.nmap && out.nmap.scanned) || []).length,\n  ips_skipped: skipped,\n  unique_open_ports: openSeen.size,\n  non_web_open_ports: nonWeb.slice(0, 20),\n  top_technologies: Object.entries(tech).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([name, count]) => ({ name, count })),\n  warnings: out.warnings || [],\n  next_step: 'run_vulnerability_scan',\n};\nreturn [{ json: { scan_id: g.scan_id, stage: 'fingerprint_done', updated_at: new Date().toISOString(), fingerprint_summary: summary } }];\n"
+      },
+      "id": "fb13b37a-dc9f-53bd-adc2-7837a22582fa",
+      "name": "Fingerprint Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2340,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "collection": "scan_runs",
+        "updateKey": "scan_id",
+        "fields": "scan_id,stage,updated_at,fingerprint_summary",
+        "options": {
+          "dateFields": "updated_at"
+        }
+      },
+      "id": "19957c9f-d0c4-5286-81ec-3f6a0da2cca0",
+      "name": "Update Scan Run",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.1,
+      "position": [
+        2600,
+        300
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "asmMongoDb000001",
+          "name": "ASM MongoDB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: $('Fingerprint Summary').first().json.fingerprint_summary }];\n"
+      },
+      "id": "b4d895c8-569a-5a12-963d-523e929ee190",
+      "name": "Final Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2860,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "content": "Fingerprint sub-workflow\nGate: needs an approved, running scan at stage discovery_done. Targets = live hosts from THIS scan (read from MongoDB). SSH: httpx (tech, TLS) + nmap -sT -sV on public, non-CDN IPs. Writes http / tls / port_scanning sections.",
+        "height": 160,
+        "width": 1000,
+        "color": 4
+      },
+      "id": "e19b2c28-901c-57e5-b9a0-de982e88e54a",
+      "name": "Note Fingerprint sub-workflow",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        80
+      ]
+    }
+  ],
+  "connections": {
+    "When Executed by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "Validate Domain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Domain": {
+      "main": [
+        [
+          {
+            "node": "Find Active Scan Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Active Scan Run": {
+      "main": [
+        [
+          {
+            "node": "Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gate": {
+      "main": [
+        [
+          {
+            "node": "Find Live Hosts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Live Hosts": {
+      "main": [
+        [
+          {
+            "node": "Build Target List",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Target List": {
+      "main": [
+        [
+          {
+            "node": "Run Fingerprint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Fingerprint": {
+      "main": [
+        [
+          {
+            "node": "Normalize Fingerprint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Fingerprint": {
+      "main": [
+        [
+          {
+            "node": "Update Hosts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Hosts": {
+      "main": [
+        [
+          {
+            "node": "Fingerprint Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fingerprint Summary": {
+      "main": [
+        [
+          {
+            "node": "Update Scan Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Scan Run": {
+      "main": [
+        [
+          {
+            "node": "Final Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

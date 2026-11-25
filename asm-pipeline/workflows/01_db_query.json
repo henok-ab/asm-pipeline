@@ -1,0 +1,172 @@
+{
+  "id": "asmDbQuery000001",
+  "name": "ASM - 1. DB Query (tool: check_previous_scans)",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "domain",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "id": "a63fba48-985d-5dae-87a6-67c2a5565e8b",
+      "name": "When Executed by Another Workflow",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = String($input.first().json.domain || '').trim().toLowerCase()\n  .replace(/^[a-z]+:\\/\\//, '').replace(/[\\/?#].*$/, '').replace(/\\.$/, '');\nconst re = /^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$/;\nif (!re.test(raw)) {\n  throw new Error('Invalid domain \"' + raw + '\". Provide a bare domain such as example.com.');\n}\nreturn [{ json: { domain: raw } }];\n"
+      },
+      "id": "a27ffe37-b932-56dd-ac25-885ac9a15051",
+      "name": "Validate Domain",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "find",
+        "collection": "scan_runs",
+        "options": {
+          "limit": 1,
+          "sort": "{\"started_at\":-1}"
+        },
+        "query": "={\"root_domain\":\"{{ $('Validate Domain').first().json.domain }}\"}"
+      },
+      "id": "c98fc947-0df7-5526-9936-7e8d4e275a14",
+      "name": "Find Last Scan Run",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.1,
+      "position": [
+        520,
+        300
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "asmMongoDb000001",
+          "name": "ASM MongoDB"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "find",
+        "collection": "domains",
+        "options": {},
+        "query": "={\"root_domain\":\"{{ $('Validate Domain').first().json.domain }}\"}"
+      },
+      "id": "7e0d2ce4-b794-54ce-b2fb-bff0f3baf9cc",
+      "name": "Find Domain Assets",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.1,
+      "position": [
+        780,
+        300
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "asmMongoDb000001",
+          "name": "ASM MongoDB"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const HIGH_RISK = {23:'Telnet',111:'rpcbind',135:'MS-RPC',139:'NetBIOS',445:'SMB',1433:'MSSQL',1521:'Oracle DB',2049:'NFS',2375:'Docker API (plaintext)',2376:'Docker API (TLS)',3306:'MySQL',3389:'RDP',5432:'PostgreSQL',5900:'VNC',5984:'CouchDB',6379:'Redis',9200:'Elasticsearch',9300:'Elasticsearch transport',11211:'Memcached',27017:'MongoDB'};\nconst MEDIUM_RISK = {21:'FTP',110:'POP3 (cleartext)',143:'IMAP (cleartext)',389:'LDAP',5601:'Kibana',9090:'Admin/metrics UI'};\nconst LOW_RISK = {22:'SSH',25:'SMTP',53:'DNS'};\nconst LEVELS = ['none', 'info', 'low', 'medium', 'high', 'critical'];\nconst SEVS = ['critical', 'high', 'medium', 'low', 'info', 'unknown'];\n\nfunction summarize(assets) {\n  const sev = { critical: 0, high: 0, medium: 0, low: 0, info: 0, unknown: 0 };\n  let level = 'none';\n  const bump = (l) => { if (LEVELS.indexOf(l) > LEVELS.indexOf(level)) level = l; };\n  const reasons = [];\n  const svcMap = new Map();\n  const openAll = new Set();\n  const tlsIssues = [];\n  const findings = [];\n  const dangling = [];\n  let live = 0, resolved = 0;\n\n  for (const a of assets) {\n    if (a.status === 'live') live++;\n    if (a.status === 'live' || a.status === 'resolved') resolved++;\n    if (a.dns && a.dns.dangling_cname) dangling.push(a.host);\n\n    for (const ipr of ((a.port_scanning && a.port_scanning.ips) || [])) {\n      for (const p of (ipr.open_ports || [])) {\n        openAll.add(ipr.ip + ':' + p.port);\n        const risk = HIGH_RISK[p.port] ? 'high' : MEDIUM_RISK[p.port] ? 'medium' : LOW_RISK[p.port] ? 'low' : null;\n        if (!risk) continue;\n        const key = ipr.ip + ':' + p.port;\n        if (!svcMap.has(key)) {\n          svcMap.set(key, {\n            ip: ipr.ip, port: p.port,\n            service: p.service || HIGH_RISK[p.port] || MEDIUM_RISK[p.port] || LOW_RISK[p.port],\n            product: [p.product, p.version].filter(Boolean).join(' ') || null,\n            risk, hosts: [],\n          });\n        }\n        svcMap.get(key).hosts.push(a.host);\n      }\n    }\n\n    for (const c of ((a.tls && a.tls.certificates) || [])) {\n      const issues = [];\n      if (c.expired) issues.push('expired');\n      if (c.self_signed) issues.push('self-signed');\n      if (c.mismatched) issues.push('hostname mismatch');\n      if (c.untrusted && !c.self_signed) issues.push('untrusted chain');\n      if (!c.expired && typeof c.days_to_expiry === 'number' && c.days_to_expiry >= 0 && c.days_to_expiry <= 14) {\n        issues.push('expires in ' + c.days_to_expiry + ' days');\n      }\n      if (issues.length) tlsIssues.push({ host: a.host, port: c.port, issues });\n    }\n\n    for (const f of ((a.nuclei && a.nuclei.findings) || [])) {\n      const s = SEVS.includes(f.severity) ? f.severity : 'unknown';\n      sev[s]++;\n      findings.push({ host: a.host, template_id: f.template_id, name: f.name, severity: s, matched_at: f.matched_at, cve: f.cve || [] });\n    }\n  }\n\n  const services = Array.from(svcMap.values());\n  const hi = services.filter((s) => s.risk === 'high');\n  const med = services.filter((s) => s.risk === 'medium');\n  const lo = services.filter((s) => s.risk === 'low');\n  const fmt = (arr) => arr.slice(0, 5).map((s) => s.service + ' on ' + s.ip + ':' + s.port).join(', ');\n\n  if (live > 0) bump('info');\n  if (sev.critical) { bump('critical'); reasons.push(sev.critical + ' critical Nuclei finding(s)'); }\n  if (sev.high) { bump('high'); reasons.push(sev.high + ' high-severity Nuclei finding(s)'); }\n  if (sev.medium) { bump('medium'); reasons.push(sev.medium + ' medium-severity Nuclei finding(s)'); }\n  if (sev.low) { bump('low'); reasons.push(sev.low + ' low-severity Nuclei finding(s)'); }\n  if (hi.length) { bump('high'); reasons.push(hi.length + ' high-risk service(s) reachable from the internet: ' + fmt(hi)); }\n  if (med.length) { bump('medium'); reasons.push(med.length + ' medium-risk service(s) reachable: ' + fmt(med)); }\n  if (lo.length) { bump('low'); reasons.push(lo.length + ' management/infrastructure service(s) reachable: ' + fmt(lo)); }\n  if (tlsIssues.length) { bump('low'); reasons.push(tlsIssues.length + ' TLS certificate issue(s), e.g. ' + tlsIssues[0].host + ':' + tlsIssues[0].port + ' (' + tlsIssues[0].issues.join(', ') + ')'); }\n  if (dangling.length) { bump('low'); reasons.push(dangling.length + ' dangling CNAME(s) (possible subdomain-takeover candidates, needs manual verification): ' + dangling.slice(0, 3).join(', ')); }\n  if (!reasons.length) {\n    reasons.push(live > 0\n      ? live + ' live web host(s) are internet-facing; no risky services, TLS problems or Nuclei findings were detected within the scan profile'\n      : 'No live hosts were found for this domain');\n  }\n\n  const verdict = ['critical', 'high', 'medium'].includes(level) ? 'EXPOSED'\n    : level === 'low' ? 'LIMITED_EXPOSURE'\n    : level === 'info' ? 'INTERNET_FACING_ONLY'\n    : 'NO_EXPOSURE_FOUND';\n\n  return {\n    verdict,\n    exposure_level: level,\n    reasons,\n    stats: {\n      assets: assets.length, live_hosts: live, resolved_hosts: resolved,\n      open_ports_total: openAll.size, risky_services: services.length,\n      tls_issues: tlsIssues.length, dangling_cnames: dangling.length, nuclei: sev,\n    },\n    risky_services: services.sort((x, y) => LEVELS.indexOf(y.risk) - LEVELS.indexOf(x.risk)).slice(0, 20),\n    tls_issues: tlsIssues.slice(0, 10),\n    top_findings: findings.sort((x, y) => SEVS.indexOf(x.severity) - SEVS.indexOf(y.severity)).slice(0, 15),\n    caveat: 'Coverage is limited to the enabled enumeration sources, the targeted nmap port list and the Nuclei severity/template profile. No findings is not proof of no risk.',\n  };\n}\n\nconst domain = $('Validate Domain').first().json.domain;\nconst run = $('Find Last Scan Run').all().map((i) => i.json).find((j) => j && j.scan_id) || null;\nconst assets = $input.all().map((i) => i.json).filter((j) => j && j.host);\n\nlet lastTime = null;\nif (run) lastTime = run.finished_at || run.updated_at || run.started_at || null;\nelse if (assets.length) lastTime = assets.map((a) => a.last_seen).filter(Boolean).sort().pop() || null;\nconst ageH = lastTime ? Math.round((Date.now() - new Date(lastTime).getTime()) / 360000) / 10 : null;\nconst previously = !!(run || assets.length);\n\nlet recommendation;\nif (!previously) recommendation = 'No stored data for this domain. A new scan needs explicit user approval.';\nelse if (ageH !== null && ageH < 24) recommendation = 'Stored data is recent (<24h). You can answer from it; a rescan still requires explicit approval.';\nelse recommendation = 'Stored data is older than 24h. Offer a refresh scan (requires explicit approval) or answer from stored data.';\n\nlet runNote = null;\nif (run && run.status === 'running') {\n  const h = (Date.now() - new Date(run.started_at).getTime()) / 3.6e6;\n  runNote = h > 6 ? 'Last scan was started but never completed (abandoned).' : 'A scan is currently in progress or did not finish.';\n}\n\nreturn [{ json: {\n  ok: true,\n  domain,\n  previously_scanned: previously,\n  last_scan_time: lastTime,\n  last_scan_age_hours: ageH,\n  last_scan: run ? { scan_id: run.scan_id, status: run.status, stage: run.stage, started_at: run.started_at, finished_at: run.finished_at || null, note: runNote } : null,\n  asset_count: assets.length,\n  stored_summary: assets.length ? summarize(assets) : null,\n  recommendation,\n} }];\n"
+      },
+      "id": "beefdedd-4727-5416-8de2-b043113d20ba",
+      "name": "Build History Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "content": "DB Query tool\nRead-only. Looks up scan_runs (last scan time/status) and domains (stored assets), then computes the stored exposure summary. Called FIRST by the agent.",
+        "height": 160,
+        "width": 700,
+        "color": 4
+      },
+      "id": "bffd48b7-e716-5ed0-adc1-ae27f96fc42f",
+      "name": "Note DB Query tool",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        80
+      ]
+    }
+  ],
+  "connections": {
+    "When Executed by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "Validate Domain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Domain": {
+      "main": [
+        [
+          {
+            "node": "Find Last Scan Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Last Scan Run": {
+      "main": [
+        [
+          {
+            "node": "Find Domain Assets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Domain Assets": {
+      "main": [
+        [
+          {
+            "node": "Build History Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}
